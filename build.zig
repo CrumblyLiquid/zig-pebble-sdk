@@ -118,6 +118,15 @@ fn pebble_sdk_paths(b: *std.Build, pebble_sdk_path: []const u8, platform: Pebble
 // Pebble Header Fixup
 ////////////////////////////////////////////////////////////////////////////////
 
+fn fixup(b: *std.Build, header: []const u8, comptime variants: []const []const u8, replacement: []const u8) []u8 {
+    inline for (variants) |variant| {
+        if (std.mem.indexOf(u8, header, variant) != null) {
+            return std.mem.replaceOwned(u8, b.allocator, header, variant, replacement) catch @panic("OOM");
+        }
+    }
+    std.debug.panic("pebble.h fixup failed: none of the expected spellings found:\n{s}", .{variants[0]});
+}
+
 fn pebble_header_fixup(b: *std.Build, pebble_include_path: []const u8) []const u8 {
     var pebble_header = std.Io.Dir.cwd().readFileAlloc(
         b.graph.io,
@@ -137,7 +146,7 @@ fn pebble_header_fixup(b: *std.Build, pebble_include_path: []const u8) []const u
     // Bitfields need to be removed, as they are currently unsupported by Zig Translate C
 
     // Remove RBGA bitfield in union GColor8
-    pebble_header = std.mem.replaceOwned(u8, b.allocator, pebble_header,
+    pebble_header = fixup(b, pebble_header, &.{
         \\typedef union GColor8 {
         \\  uint8_t argb;
         \\  struct {
@@ -147,38 +156,47 @@ fn pebble_header_fixup(b: *std.Build, pebble_include_path: []const u8) []const u
         \\    uint8_t a:2; //!< Alpha. 3 = 100% opaque, 2 = 66% opaque, 1 = 33% opaque, 0 = transparent.
         \\  };
         \\} GColor8;
-    , "typedef struct GColor8 { uint8_t argb; } GColor8;") catch @panic("OOM");
+        ,
+        \\typedef union GColor8 {
+        \\  uint8_t argb;
+        \\  struct {
+        \\    uint8_t b : 2; //!< Blue
+        \\    uint8_t g : 2; //!< Green
+        \\    uint8_t r : 2; //!< Red
+        \\    uint8_t a : 2; //!< Alpha. 3 = 100% opaque, 2 = 66% opaque, 1 = 33% opaque, 0 = transparent.
+        \\  };
+        \\} GColor8;
+    }, "typedef struct GColor8 { uint8_t argb; } GColor8;");
 
     // Replace GColorFromRGBA macro from gcolor_definitions.h
-    pebble_header = std.mem.replaceOwned(u8, b.allocator, pebble_header,
+    pebble_header = fixup(b, pebble_header, &.{
         \\#include "gcolor_definitions.h"
-    ,
+    },
         \\#define GColorFromRGBA(red, green, blue, alpha) ((GColor8){.argb = (((alpha >> 6) << 6) | ((red >> 6) << 4) | ((green >> 6) << 2) | (blue >> 6))})
         \\#include "gcolor_definitions.h"
-    ) catch @panic("OOM");
+    );
 
     // Replace bitfields with uint8_t in HealthMinuteData
-    pebble_header = std.mem.replaceOwned(u8, b.allocator, pebble_header,
+    pebble_header = fixup(b, pebble_header, &.{
         \\  bool is_invalid: 1;         //!< `true` if the item doesn't represents actual data
         \\                              //!< and should be ignored.
         \\  AmbientLightLevel light: 3; //!< Instantaneous light level during this minute.
         \\  uint8_t padding: 4;
-    , "  uint8_t is_invalid_and_light_level;") catch @panic("OOM");
+        ,
+        \\  bool is_invalid : 1;         //!< `true` if the item doesn't represents actual data
+        \\                               //!< and should be ignored.
+        \\  AmbientLightLevel light : 3; //!< Instantaneous light level during this minute.
+        \\  uint8_t padding : 4;
+    }, "  uint8_t is_invalid_and_light_level;");
 
     // Replace type bitfield with uint8_t in Tuple
-    pebble_header = std.mem.replaceOwned(u8, b.allocator, pebble_header,
-        \\  TupleType type:8;
-    , "  uint8_t type;") catch @panic("OOM");
+    pebble_header = fixup(b, pebble_header, &.{ "  TupleType type:8;", "  TupleType type : 8;" }, "  uint8_t type;");
 
     // Replace type bitfield with uint8_t in TouchEvent
-    pebble_header = std.mem.replaceOwned(u8, b.allocator, pebble_header,
-        \\  TouchEventType type:8;
-    , "  uint8_t type;") catch @panic("OOM");
+    pebble_header = fixup(b, pebble_header, &.{ "  TouchEventType type:8;", "  TouchEventType type : 8;" }, "  uint8_t type;");
 
     // Add packed alignment to Tuple value union type
-    pebble_header = std.mem.replaceOwned(u8, b.allocator, pebble_header,
-        \\  } value[];
-    , "  } __attribute__((__packed__)) value[];") catch @panic("OOM");
+    pebble_header = fixup(b, pebble_header, &.{"  } value[];"}, "  } __attribute__((__packed__)) value[];");
 
     return pebble_header;
 }
@@ -305,6 +323,8 @@ const PebbleAppinfoObject = struct {
     versionLabel: []const u8,
     uuid: []const u8,
     sdkVersion: []const u8,
+    manifestVersion: u8,
+    usesPermissions: []const PebblePermission,
     targetPlatforms: []const PebblePlatform,
     enableMultiJS: bool,
     watchapp: @FieldType(PebbleAppMetadata, "watchapp"),
@@ -328,6 +348,8 @@ fn pebble_appinfo_json_template(b: *std.Build, name: []const u8, metadata: Pebbl
         .versionLabel = b.fmt("{d}.{d}.0", .{ metadata.version.major, metadata.version.minor }),
         .uuid = metadata.uuid,
         .sdkVersion = b.fmt("{d}", .{metadata.sdkVersion}),
+        .manifestVersion = metadata.manifestVersion,
+        .usesPermissions = metadata.usesPermissions,
         .targetPlatforms = metadata.targetPlatforms,
         .enableMultiJS = metadata.enableMultiJS,
         .watchapp = metadata.watchapp,
@@ -344,6 +366,28 @@ fn pebble_appinfo_json_template(b: *std.Build, name: []const u8, metadata: Pebbl
 ////////////////////////////////////////////////////////////////////////////////
 
 pub const PebbleCapability = enum { location, configurable, health };
+
+pub const PebblePermission = union(enum) {
+    name: enum { Internet, LocalNetwork, Location, Timeline, WatchMicrophone },
+    internet: struct { domains: []const []const u8 },
+
+    pub fn jsonStringify(value: @This(), jws: anytype) !void {
+        switch (value) {
+            .name => |name| try jws.write(@tagName(name)),
+            .internet => |internet| {
+                try jws.beginObject();
+                try jws.objectField("name");
+                try jws.write("Internet");
+                try jws.objectField("parameters");
+                try jws.beginObject();
+                try jws.objectField("domains");
+                try jws.write(internet.domains);
+                try jws.endObject();
+                try jws.endObject();
+            },
+        }
+    }
+};
 
 pub const PebbleAppMessageKey = struct {
     key: []const u8,
@@ -439,6 +483,8 @@ pub const PebbleAppMetadata = struct {
     uuid: []const u8,
     version: struct { major: u8, minor: u8 },
     sdkVersion: usize = 3,
+    manifestVersion: u8 = 2,
+    usesPermissions: []const PebblePermission = &.{},
     targetPlatforms: []const PebblePlatform,
     enableMultiJS: bool = true,
     watchapp: struct {
@@ -461,21 +507,38 @@ pub const PebbleApplicationOptions = struct {
     pebblekit_js_file: ?std.Build.LazyPath = null,
     pebblekit_js_map_file: ?std.Build.LazyPath = null,
     optimize: std.builtin.OptimizeMode = .ReleaseSafe,
+    pebble_sdk_version: []const u8 = "current",
 };
 
-pub fn addPebbleApplication(b: *std.Build, options: PebbleApplicationOptions) void {
+pub fn build(b: *std.Build) void {
+    _ = b;
+}
+
+pub const PebbleAppTarget = struct {
+    platform: PebblePlatform,
+    target: std.Build.ResolvedTarget,
+    root_module: *std.Build.Module,
+    exe: *std.Build.Step.Compile,
+    toolchain_include_path: []const u8,
+    defines: []const []const u8,
+    pebble_module: *std.Build.Module,
+};
+
+pub fn addPebbleApplication(b: *std.Build, options: PebbleApplicationOptions) []const PebbleAppTarget {
     // Resolve pebble target and optimize
     const target = b.resolveTargetQuery(.{ .cpu_arch = .thumb, .os_tag = .freestanding, .abi = .eabi, .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_m3 } });
     const optimize = options.optimize;
 
     // Look up pebble sdk path
-    const pebble_sdk_path = b.option([]const u8, "pebble_sdk_path", "Pebble SDK path (default ~/.pebble-sdk/SDKs/current/)") orelse path: {
+    const pebble_sdk_path = b.option([]const u8, "pebble_sdk_path", "Pebble SDK path (default ~/.pebble-sdk/SDKs/<pebble_sdk_version>/)") orelse path: {
         if (b.graph.environ_map.get("HOME")) |home_path| {
-            break :path b.pathJoin(&.{ home_path, ".pebble-sdk/SDKs/current" });
+            break :path b.pathJoin(&.{ home_path, ".pebble-sdk/SDKs", options.pebble_sdk_version });
         } else {
             std.debug.panic("Unable to determine Pebble SDK path. Please set the 'pebble_sdk_path' build option.", .{});
         }
     };
+
+    var app_targets = std.array_list.Managed(PebbleAppTarget).init(b.allocator);
 
     // Create app artifacts list
     var pebble_app_artifacts = std.array_list.Managed(struct {
@@ -573,8 +636,18 @@ pub fn addPebbleApplication(b: *std.Build, options: PebbleApplicationOptions) vo
         exe.root_module.addObject(appinfo_object);
         exe.setLinkerScript(linker_script);
         exe.entry = .{ .symbol_name = "main" };
+        exe.link_emit_relocs = true;
         b.build_id = .sha1;
         exe.step.dependOn(&linker_script_step.step);
+        app_targets.append(.{
+            .platform = platform,
+            .target = target,
+            .root_module = root_module,
+            .exe = exe,
+            .toolchain_include_path = paths.toolchain_include_path,
+            .defines = PEBBLE_PLATFORMS.getAssertContains(platform).DEFINES,
+            .pebble_module = translate_pebble_mod,
+        }) catch @panic("OOM");
         b.getInstallStep().dependOn(&b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .prefix }, .dest_sub_path = b.fmt("{s}/{s}.elf", .{ @tagName(platform), options.name }) }).step);
 
         // Extract binary with objcopy
@@ -676,4 +749,6 @@ pub fn addPebbleApplication(b: *std.Build, options: PebbleApplicationOptions) vo
     if (b.args) |args| {
         run_upload_step.addArgs(args);
     }
+
+    return app_targets.toOwnedSlice() catch @panic("OOM");
 }
